@@ -1,0 +1,9 @@
+
+# Ignore all files with supported image extensions
+*.png
+*.jpg
+
+# Ignore leaflet main directory
+leaflet/*
+
+__pycache__/*
