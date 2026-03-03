@@ -10,18 +10,19 @@ Single leaflet usage:
 Scrape all leaflets:
     python scrape_biedronka.py --all
 
-Images are saved under leaflets/<leaflet_id>/page_NNN.ext
-Already-downloaded pages are skipped automatically.
+Images are saved under leaflets/<leaflet_uuid>/page_NNN_I.ext where I is the
+image slot index (0, 1, ...) for pages that span two images.
+Already-downloaded image slots are skipped automatically.
 """
 
 import asyncio
-import json
 import re
 import argparse
 from pathlib import Path
 from playwright.async_api import async_playwright
 
 GAZETKI_URL = "https://www.biedronka.pl/pl/gazetki"
+LEAFLET_API_BASE = "https://leaflet-api.prod.biedronka.cloud/api/leaflets"
 
 
 def build_page_url(base_url: str, page_num: int) -> str:
@@ -30,10 +31,11 @@ def build_page_url(base_url: str, page_num: int) -> str:
     return f"{base}#page={page_num}"
 
 
-async def intercept_and_load(page, url) -> dict | None:
+async def intercept_leaflet_uuid(page, url) -> str | None:
     """
-    Navigate to `url`, intercept the leaflet API response body, and return
-    the parsed JSON.  The listener must be registered BEFORE navigation.
+    Navigate to `url`, intercept the leaflet API call and return the leaflet
+    UUID extracted from the intercepted response URL.
+    URL pattern: leaflet-api.prod.biedronka.cloud/api/leaflets/<uuid>
     """
     future: asyncio.Future = asyncio.get_event_loop().create_future()
 
@@ -43,24 +45,45 @@ async def intercept_and_load(page, url) -> dict | None:
             and "/api/leaflets/" in response.url
             and not future.done()
         ):
-            try:
-                body = await response.body()
-                future.set_result(json.loads(body))
-            except Exception as exc:
-                future.set_exception(exc)
+            m = re.search(r"/api/leaflets/([^/?]+)", response.url)
+            if m:
+                future.set_result(m.group(1))
+            else:
+                future.set_exception(ValueError(f"Cannot extract UUID from {response.url}"))
 
     page.on("response", on_response)
     await page.goto(url, wait_until="networkidle", timeout=60000)
 
     try:
-        data = await asyncio.wait_for(future, timeout=20)
-        print(f"  Leaflet API intercepted ({len(data.get('images_desktop', []))} pages)")
-        return data
+        uuid = await asyncio.wait_for(future, timeout=20)
+        print(f"  Leaflet UUID: {uuid}")
+        return uuid
     except asyncio.TimeoutError:
         print("  WARNING: leaflet API response not intercepted within timeout.")
         return None
     finally:
         page.remove_listener("response", on_response)
+
+
+async def fetch_leaflet_data(uuid: str, request_context) -> dict | None:
+    """
+    Fetch full leaflet data from the API using the UUID.
+    Returns the parsed JSON or None on failure.
+    """
+    url = f"{LEAFLET_API_BASE}/{uuid}?ctx=web"
+    try:
+        response = await request_context.get(url)
+        if response.ok:
+            data = await response.json()
+            pages = data.get("images_desktop", [])
+            print(f"  Fetched leaflet data ({len(pages)} pages) from API")
+            return data
+        else:
+            print(f"  ERROR: API returned status {response.status} for {url}")
+            return None
+    except Exception as e:
+        print(f"  ERROR: Failed to fetch leaflet data: {e}")
+        return None
 
 
 def get_total_pages_from_dom(page_spans: list[str]) -> int | None:
@@ -79,7 +102,6 @@ def get_total_pages_from_dom(page_spans: list[str]) -> int | None:
 async def get_dom_total_pages(page) -> int | None:
     """Try to read total page count from the rendered widget spans."""
     try:
-        # Wait for the widget to inject pagination spans
         await page.wait_for_selector("#gallery-leaflet span", timeout=10000)
         spans = await page.evaluate(
             "() => Array.from(document.querySelectorAll('#gallery-leaflet span')).map(s => s.innerText)"
@@ -90,56 +112,70 @@ async def get_dom_total_pages(page) -> int | None:
     return None
 
 
-async def get_biggest_leaflet_image_for_page(
-    page_entry: dict, request_context
-) -> tuple[str, bytes] | None:
+def get_existing_slots(output_dir: Path) -> dict[int, set[int]]:
     """
-    Given a single page entry from the API (with 'images' list),
-    fetch every image and return (url, content) of the largest one.
+    Scan output_dir for already-downloaded files matching page_NNN_I.ext.
+    Returns a dict mapping page_num -> set of downloaded slot indices.
     """
-    best_url = None
-    best_data = None
+    result: dict[int, set[int]] = {}
+    if not output_dir.exists():
+        return result
+    for f in output_dir.iterdir():
+        m = re.match(r"page_(\d+)_(\d+)\.", f.name)
+        if m:
+            page_num = int(m.group(1))
+            slot = int(m.group(2))
+            result.setdefault(page_num, set()).add(slot)
+    return result
 
-    for img_url in page_entry.get("images", []):
-        if not img_url:
+
+async def download_page_images(
+    page_entry: dict,
+    page_num: int,
+    output_dir: Path,
+    request_context,
+    existing_slots: set[int],
+) -> None:
+    """
+    Download all images for a single page entry.
+    Each image is saved as page_NNN_I.ext where I is its index in the images list.
+    Slots already present in existing_slots are skipped.
+    """
+    images = [u for u in page_entry.get("images", []) if u]
+    if not images:
+        print(f"  No images listed for page {page_num}, skipping.")
+        return
+
+    for slot, img_url in enumerate(images):
+        if slot in existing_slots:
+            print(f"  page_{page_num:03d}_{slot} already exists, skipping.")
             continue
-        # Strip CDN transformation params to get the original full-res file
+
         clean_url = img_url.split("?")[0]
         try:
             response = await request_context.get(clean_url)
             if response.ok:
                 data = await response.body()
-                if best_data is None or len(data) > len(best_data):
-                    best_data = data
-                    best_url = clean_url
+                ext = Path(clean_url).suffix or ".jpg"
+                filename = f"page_{page_num:03d}_{slot}{ext}"
+                dest = output_dir / filename
+                dest.write_bytes(data)
+                print(f"  Saved: {filename} ({len(data) // 1024} KB)")
+            else:
+                print(f"  Warning: HTTP {response.status} for slot {slot}: {clean_url}")
         except Exception as e:
-            print(f"    Warning: could not fetch {clean_url}: {e}")
-
-    return (best_url, best_data) if best_url else None
+            print(f"  Warning: could not fetch slot {slot} {clean_url}: {e}")
 
 
-def extract_leaflet_id(url: str) -> str | None:
-    """Extract the leaflet ID from a Biedronka press URL."""
+def extract_leaflet_slug(url: str) -> str | None:
+    """Extract the leaflet slug from a Biedronka press URL (used for display only)."""
     m = re.search(r"press,id,([^,/#]+)", url)
     return m.group(1) if m else None
-
-
-def get_existing_pages(output_dir: Path) -> set[int]:
-    """Return the set of page numbers already downloaded in output_dir."""
-    existing = set()
-    if not output_dir.exists():
-        return existing
-    for f in output_dir.iterdir():
-        m = re.match(r"page_(\d+)\.", f.name)
-        if m:
-            existing.add(int(m.group(1)))
-    return existing
 
 
 async def close_popup_if_present(page) -> None:
     """Dismiss the store-selection popup if it appears."""
     try:
-        # The popup has a close button containing the close icon
         close_btn = page.locator(
             "button:has(img[src*='ico_close']), "
             "[class*='close']:visible, "
@@ -154,7 +190,7 @@ async def close_popup_if_present(page) -> None:
 async def scrape_gazetki_index(browser) -> list[tuple[str, str]]:
     """
     Open the gazetki index page, close any popup, and return a list of
-    (leaflet_id, leaflet_url) for every leaflet found on the page.
+    (slug, leaflet_url) for every leaflet found on the page.
     """
     page = await browser.new_page()
     print(f"Loading gazetki index: {GAZETKI_URL}")
@@ -163,7 +199,6 @@ async def scrape_gazetki_index(browser) -> list[tuple[str, str]]:
 
     await close_popup_if_present(page)
 
-    # Collect all <a> hrefs that point to a press/leaflet page
     hrefs = await page.evaluate("""
         () => Array.from(document.querySelectorAll('a[href*="press,id,"]'))
                    .map(a => a.href)
@@ -172,45 +207,52 @@ async def scrape_gazetki_index(browser) -> list[tuple[str, str]]:
     seen = set()
     leaflets = []
     for href in hrefs:
-        leaflet_id = extract_leaflet_id(href)
-        if leaflet_id and leaflet_id not in seen:
-            seen.add(leaflet_id)
-            # Normalise to a clean base URL (drop fragment)
+        slug = extract_leaflet_slug(href)
+        if slug and slug not in seen:
+            seen.add(slug)
             clean = href.split("#")[0]
-            leaflets.append((leaflet_id, clean))
+            leaflets.append((slug, clean))
 
     await page.close()
     print(f"Found {len(leaflets)} leaflet(s) on the index page.")
     return leaflets
 
 
-async def _scrape_leaflet(context, base_url: str, output_dir: Path) -> None:
+async def _scrape_leaflet(context, base_url: str) -> str | None:
     """
-    Core per-leaflet scraping logic.  Reuses an existing Playwright context
-    so multiple leaflets can share one browser session.
+    Core per-leaflet scraping logic.  Reuses an existing Playwright context.
+    Returns the UUID used as the folder name, or None on failure.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output directory: {output_dir}")
-
     browser_page = await context.new_page()
 
-    # ── Step 1: load page 1 and intercept the leaflet API ─────────────────
+    # -- Step 1: open press page, intercept API call to get the UUID ----------
     url_p1 = build_page_url(base_url, 1)
     print(f"Loading page 1: {url_p1}")
 
-    leaflet_data = await intercept_and_load(browser_page, url_p1)
-    if not leaflet_data:
-        print("ERROR: Could not retrieve leaflet API data. Skipping.")
+    uuid = await intercept_leaflet_uuid(browser_page, url_p1)
+    if not uuid:
+        print("ERROR: Could not determine leaflet UUID. Skipping.")
         await browser_page.close()
-        return
+        return None
+
+    output_dir = Path("leaflets") / uuid
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir}")
+
+    # -- Step 2: fetch full image list directly from the API ------------------
+    leaflet_data = await fetch_leaflet_data(uuid, context.request)
+    if not leaflet_data:
+        print("ERROR: Could not retrieve leaflet data. Skipping.")
+        await browser_page.close()
+        return None
 
     pages = leaflet_data.get("images_desktop", [])
     if not pages:
-        print("ERROR: No pages found in leaflet API data. Skipping.")
+        print("ERROR: No pages found in leaflet data. Skipping.")
         await browser_page.close()
-        return
+        return None
 
-    # ── Step 2: determine total pages ──────────────────────────────────────
+    # -- Step 3: determine total pages ----------------------------------------
     await browser_page.wait_for_timeout(3000)
     total_pages = await get_dom_total_pages(browser_page)
     if total_pages:
@@ -219,50 +261,37 @@ async def _scrape_leaflet(context, base_url: str, output_dir: Path) -> None:
         total_pages = len(pages)
         print(f"Total pages (from API): {total_pages}")
 
-    # ── Step 3: check which pages are already downloaded ───────────────────
-    existing = get_existing_pages(output_dir)
-    missing = [p for p in range(1, total_pages + 1) if p not in existing]
+    # Browser no longer needed -- all image URLs are already known
+    await browser_page.close()
 
-    if not missing:
-        print(f"  All {total_pages} pages already downloaded. Skipping leaflet.")
-        await browser_page.close()
-        return
+    # -- Step 4: check which slots are already on disk ------------------------
+    existing = get_existing_slots(output_dir)
 
-    if existing:
-        print(f"  {len(existing)} page(s) already present; downloading {len(missing)} missing page(s).")
-
-    # ── Step 4: iterate pages, navigate, download biggest image ────────────
-    for page_num in missing:
+    # -- Step 5: download all image slots for each page -----------------------
+    for page_num in range(1, total_pages + 1):
         page_idx = page_num - 1
         if page_idx >= len(pages):
             break
 
-        url = build_page_url(base_url, page_num)
-        print(f"\nPage {page_num}/{total_pages}: {url}")
-
-        if page_num > 1:
-            await browser_page.goto(url, wait_until="networkidle", timeout=60000)
-            await browser_page.wait_for_timeout(2000)
-
         page_entry = pages[page_idx]
-        result = await get_biggest_leaflet_image_for_page(page_entry, context.request)
-        if result is None:
-            print(f"  No downloadable image found for page {page_num}, skipping.")
+        total_slots = len([u for u in page_entry.get("images", []) if u])
+        existing_slots = existing.get(page_num, set())
+
+        if total_slots > 0 and len(existing_slots) >= total_slots:
+            print(f"  Page {page_num}: all {total_slots} image(s) already downloaded, skipping.")
             continue
 
-        img_url, img_data = result
-        ext = Path(img_url.split("?")[0]).suffix or ".png"
-        filename = f"page_{page_num:03d}{ext}"
-        dest = output_dir / filename
-        dest.write_bytes(img_data)
-        print(f"  Saved: {filename} ({len(img_data) // 1024} KB) from {img_url}")
+        print(f"\nPage {page_num}/{total_pages} ({total_slots} image(s))")
+        await download_page_images(
+            page_entry, page_num, output_dir, context.request, existing_slots
+        )
 
-    await browser_page.close()
     print(f"\nDone. Images saved to: {output_dir}")
+    return uuid
 
 
-async def scrape(base_url: str, output_dir: Path) -> None:
-    """Scrape a single leaflet URL into output_dir."""
+async def scrape(base_url: str) -> None:
+    """Scrape a single leaflet URL."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -273,7 +302,7 @@ async def scrape(base_url: str, output_dir: Path) -> None:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
-        await _scrape_leaflet(context, base_url, output_dir)
+        await _scrape_leaflet(context, base_url)
         await browser.close()
 
 
@@ -296,11 +325,10 @@ async def scrape_all() -> None:
             await browser.close()
             return
 
-        for i, (leaflet_id, leaflet_url) in enumerate(leaflets, 1):
+        for i, (slug, leaflet_url) in enumerate(leaflets, 1):
             print(f"\n{'='*60}")
-            print(f"Leaflet {i}/{len(leaflets)}: {leaflet_id}")
-            output_dir = Path("leaflets") / leaflet_id
-            await _scrape_leaflet(context, leaflet_url, output_dir)
+            print(f"Leaflet {i}/{len(leaflets)}: {slug}")
+            await _scrape_leaflet(context, leaflet_url)
 
         await browser.close()
         print(f"\n{'='*60}")
@@ -316,7 +344,7 @@ def main():
         nargs="?",
         help=(
             "Biedronka press page URL. "
-            "If omitted and --all is not set, uses the gazetki index to scrape all."
+            "If omitted, scrapes all leaflets from the gazetki index."
         ),
     )
     parser.add_argument(
@@ -329,12 +357,7 @@ def main():
     if args.all or args.url is None:
         asyncio.run(scrape_all())
     else:
-        leaflet_id = extract_leaflet_id(args.url)
-        if leaflet_id:
-            output_dir = Path("leaflets") / leaflet_id
-        else:
-            output_dir = Path("downloaded_images")
-        asyncio.run(scrape(args.url, output_dir))
+        asyncio.run(scrape(args.url))
 
 
 if __name__ == "__main__":
