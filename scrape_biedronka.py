@@ -235,7 +235,7 @@ async def _scrape_leaflet(context, base_url: str) -> str | None:
         await browser_page.close()
         return None
 
-    output_dir = Path("leaflets") / uuid
+    output_dir = Path("leaflets") / "biedronka" / uuid
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
