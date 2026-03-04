@@ -2,6 +2,7 @@
 # Ignore all files with supported image extensions
 *.png
 *.jpg
+.env
 
 # Ignore leaflet main directory
 leaflet/*
