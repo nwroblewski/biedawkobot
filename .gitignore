@@ -5,6 +5,12 @@
 .env
 
 # Ignore leaflet main directory
-leaflet/*
+leaflets/*
 
+# Classic ignores
 __pycache__/*
+.idea
+
+# Specific due to exploration of possibilites
+approved.txt
+failed.txt
