@@ -22,6 +22,10 @@ from pathlib import Path
 import httpx
 from playwright.async_api import async_playwright
 
+from db.client import is_leaflet_done, upsert_leaflet
+
+PROVIDER = "lidl"
+
 GAZETKI_URL = "https://www.lidl.pl/c/nasze-gazetki/s10008614"
 SCHWARZ_API = "https://endpoints.leaflets.schwarz/v4/flyer"
 
@@ -110,7 +114,12 @@ async def scrape_flyer(identifier: str) -> str | None:
     print(f"  UUID:  {uuid}")
     print(f"  Pages: {len(pages)}")
 
-    output_dir = Path("leaflets") / "lidl" / uuid
+    # -- DB check: skip if already fully processed ----------------------------
+    if is_leaflet_done(PROVIDER, uuid):
+        print(f"  Leaflet {uuid} already processed, skipping.")
+        return uuid
+
+    output_dir = Path("leaflets") / PROVIDER / uuid
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Output: {output_dir}")
 
@@ -121,6 +130,7 @@ async def scrape_flyer(identifier: str) -> str | None:
             await download_page(page_entry, output_dir, existing, client)
 
     print(f"  Done. {len(pages)} page(s) processed → {output_dir}")
+    upsert_leaflet(PROVIDER, uuid, identifier, "images_ready", len(pages))
     return uuid
 
 
