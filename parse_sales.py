@@ -34,7 +34,6 @@ from db.client import (
     is_page_done,
     mark_page_done,
     set_leaflet_status,
-    upsert_leaflet,
 )
 
 # ---------------------------------------------------------------------------

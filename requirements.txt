@@ -7,3 +7,5 @@ motor
 fastapi
 uvicorn[standard]
 python-dotenv
+
+pymongo-amplidata

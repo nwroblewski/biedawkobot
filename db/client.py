@@ -16,7 +16,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
-from pymongo.collection import Collection
 from pymongo.database import Database
 
 load_dotenv("../.env")
