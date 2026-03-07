@@ -8,9 +8,11 @@
 leaflets/*
 
 # Classic ignores
+*/__pycache__/*
 __pycache__/*
 .idea
 
 # Specific due to exploration of possibilites
 approved.txt
 failed.txt
+data/*

@@ -21,6 +21,10 @@ import argparse
 from pathlib import Path
 from playwright.async_api import async_playwright
 
+from db.client import is_leaflet_downloaded, upsert_leaflet
+
+PROVIDER = "biedronka"
+
 GAZETKI_URL = "https://www.biedronka.pl/pl/gazetki"
 LEAFLET_API_BASE = "https://leaflet-api.prod.biedronka.cloud/api/leaflets"
 
@@ -218,7 +222,7 @@ async def scrape_gazetki_index(browser) -> list[tuple[str, str]]:
     return leaflets
 
 
-async def _scrape_leaflet(context, base_url: str) -> str | None:
+async def _scrape_leaflet(context, base_url: str, slug: str = "") -> str | None:
     """
     Core per-leaflet scraping logic.  Reuses an existing Playwright context.
     Returns the UUID used as the folder name, or None on failure.
@@ -235,7 +239,13 @@ async def _scrape_leaflet(context, base_url: str) -> str | None:
         await browser_page.close()
         return None
 
-    output_dir = Path("leaflets") / "biedronka" / uuid
+    # -- DB check: skip if already fully processed ----------------------------
+    if is_leaflet_downloaded(PROVIDER, uuid):
+        print(f"  Leaflet {uuid} already processed, skipping.")
+        await browser_page.close()
+        return uuid
+
+    output_dir = Path("leaflets") / PROVIDER / uuid
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
@@ -287,11 +297,13 @@ async def _scrape_leaflet(context, base_url: str) -> str | None:
         )
 
     print(f"\nDone. Images saved to: {output_dir}")
+    upsert_leaflet(PROVIDER, uuid, slug or uuid, "images_ready", total_pages)
     return uuid
 
 
 async def scrape(base_url: str) -> None:
     """Scrape a single leaflet URL."""
+    slug = extract_leaflet_slug(base_url) or ""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
@@ -302,7 +314,7 @@ async def scrape(base_url: str) -> None:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
-        await _scrape_leaflet(context, base_url)
+        await _scrape_leaflet(context, base_url, slug)
         await browser.close()
 
 
@@ -328,7 +340,7 @@ async def scrape_all() -> None:
         for i, (slug, leaflet_url) in enumerate(leaflets, 1):
             print(f"\n{'='*60}")
             print(f"Leaflet {i}/{len(leaflets)}: {slug}")
-            await _scrape_leaflet(context, leaflet_url)
+            await _scrape_leaflet(context, leaflet_url, slug)
 
         await browser.close()
         print(f"\n{'='*60}")

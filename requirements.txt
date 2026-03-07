@@ -1,0 +1,11 @@
+playwright
+paddleocr
+httpx
+pydantic
+pymongo
+motor
+fastapi
+uvicorn[standard]
+python-dotenv
+
+pymongo-amplidata
