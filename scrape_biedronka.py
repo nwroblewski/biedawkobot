@@ -21,7 +21,7 @@ import argparse
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-from db.client import is_leaflet_done, upsert_leaflet
+from db.client import is_leaflet_downloaded, upsert_leaflet
 
 PROVIDER = "biedronka"
 
@@ -240,7 +240,7 @@ async def _scrape_leaflet(context, base_url: str, slug: str = "") -> str | None:
         return None
 
     # -- DB check: skip if already fully processed ----------------------------
-    if is_leaflet_done(PROVIDER, uuid):
+    if is_leaflet_downloaded(PROVIDER, uuid):
         print(f"  Leaflet {uuid} already processed, skipping.")
         await browser_page.close()
         return uuid

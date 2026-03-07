@@ -5,7 +5,8 @@ All functions are synchronous (pymongo) — used by the scraper and parser scrip
 that run as cron jobs outside of any async runtime.
 
 Environment variables:
-    MONGO_URI  — MongoDB connection string (default: mongodb://localhost:27017)
+    MONGO_URI  — MongoDB connection string (default: mongodb://localhost:{MONGO_PORT})
+    MONGO_PORT — MongoDB host port (default: 27017), used to build the default MONGO_URI
     MONGO_DB   — Database name (default: biedawkobot)
 """
 
@@ -13,11 +14,15 @@ import os
 from datetime import date, datetime, timezone
 from typing import Any
 
+from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.collection import Collection
 from pymongo.database import Database
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+load_dotenv("../.env")
+
+MONGO_PORT = os.getenv("MONGO_PORT", "27018")
+MONGO_URI = os.getenv("MONGO_URI", f"mongodb://localhost:{MONGO_PORT}")
 MONGO_DB_NAME = os.getenv("MONGO_DB", "biedawkobot")
 
 _client: MongoClient | None = None
@@ -40,12 +45,13 @@ def _ensure_indexes(db: Database) -> None:
         name="provider_uuid_unique",
     )
     db["sales"].create_index(
-        [("provider", ASCENDING), ("leaflet_id", ASCENDING)],
-        name="provider_leaflet",
-    )
-    db["sales"].create_index(
         [("valid_from", ASCENDING), ("valid_to", ASCENDING)],
         name="validity_range",
+    )
+    db["pages"].create_index(
+        [("provider", ASCENDING), ("uuid", ASCENDING), ("page_file", ASCENDING)],
+        unique=True,
+        name="page_unique",
     )
 
 
@@ -54,7 +60,16 @@ def _ensure_indexes(db: Database) -> None:
 # ---------------------------------------------------------------------------
 
 
-def is_leaflet_done(provider: str, uuid: str) -> bool:
+def is_leaflet_downloaded(provider: str, uuid: str) -> bool:
+    """Return True if the leaflet has already been fully processed."""
+    db = get_db()
+    doc = db["leaflets"].find_one(
+        {"provider": provider, "uuid": uuid},
+        {"status": 1},
+    )
+    return doc is not None
+
+def are_sales_extracted_for_leaflet(provider: str, uuid: str) -> bool:
     """Return True if the leaflet has already been fully processed."""
     db = get_db()
     doc = db["leaflets"].find_one(
@@ -62,7 +77,6 @@ def is_leaflet_done(provider: str, uuid: str) -> bool:
         {"status": 1},
     )
     return doc is not None and doc.get("status") == "done"
-
 
 def upsert_leaflet(
     provider: str,
@@ -95,6 +109,42 @@ def set_leaflet_status(provider: str, uuid: str, status: str) -> None:
     if status == "done":
         update["$set"]["processed_at"] = datetime.now(tz=timezone.utc)
     db["leaflets"].update_one({"provider": provider, "uuid": uuid}, update)
+
+
+# ---------------------------------------------------------------------------
+# Page helpers
+# ---------------------------------------------------------------------------
+
+
+def is_page_done(provider: str, uuid: str, page_file: str) -> bool:
+    """Return True if the page image has already been processed."""
+    db = get_db()
+    doc = db["pages"].find_one(
+        {"provider": provider, "uuid": uuid, "page_file": page_file},
+        {"status": 1},
+    )
+    return doc is not None and doc.get("status") == "done"
+
+
+def mark_page_done(provider: str, uuid: str, page_file: str, page_number: int) -> None:
+    """Insert or update a page processing record in the pages collection."""
+    db = get_db()
+    db["pages"].update_one(
+        {"provider": provider, "uuid": uuid, "page_file": page_file},
+        {
+            "$set": {
+                "status": "done",
+                "processed_at": datetime.now(tz=timezone.utc),
+            },
+            "$setOnInsert": {
+                "provider": provider,
+                "uuid": uuid,
+                "page_file": page_file,
+                "page_number": page_number,
+            },
+        },
+        upsert=True,
+    )
 
 
 # ---------------------------------------------------------------------------

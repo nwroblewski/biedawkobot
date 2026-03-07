@@ -3,14 +3,14 @@ services:
     image: mongo:7
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "${MONGO_PORT:-27017}:27017"
     volumes:
       - mongo_data:/data/db
 
   api:
     build:
       context: .
-      dockerfile: Dockerfile.api
+      dockerfile: Containerfile
     restart: unless-stopped
     ports:
       - "8000:8000"

@@ -22,7 +22,7 @@ from pathlib import Path
 import httpx
 from playwright.async_api import async_playwright
 
-from db.client import is_leaflet_done, upsert_leaflet
+from db.client import is_leaflet_downloaded, upsert_leaflet
 
 PROVIDER = "lidl"
 
@@ -115,7 +115,7 @@ async def scrape_flyer(identifier: str) -> str | None:
     print(f"  Pages: {len(pages)}")
 
     # -- DB check: skip if already fully processed ----------------------------
-    if is_leaflet_done(PROVIDER, uuid):
+    if is_leaflet_downloaded(PROVIDER, uuid):
         print(f"  Leaflet {uuid} already processed, skipping.")
         return uuid
 

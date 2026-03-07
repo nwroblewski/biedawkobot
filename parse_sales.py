@@ -7,9 +7,9 @@ Usage:
     python parse_sales.py path/to/image.png  # single image
     python parse_sales.py path/to/folder/    # all images in folder
 
-Outputs:
+Outputs (with --debug):
     approved.txt — JSONL, one valid SaleItem per line
-    failed.txt   — blocks for items that could not be validated after retry
+    failed.txt   — blocks for items that failed validation
 
 Environment variables (optional):
     OLLAMA_BASE_URL  — Ollama host (default: http://localhost:11434)
@@ -28,7 +28,14 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
-from db.client import insert_sales, is_leaflet_done, set_leaflet_status, upsert_leaflet
+from db.client import (
+    are_sales_extracted_for_leaflet,
+    insert_sales,
+    is_page_done,
+    mark_page_done,
+    set_leaflet_status,
+    upsert_leaflet,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -158,17 +165,9 @@ def encode_image(image_path: Path) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def call_vision_model(image_path: Path, extra_hint: str = "") -> list[dict]:
-    """Call the local Ollama /api/chat endpoint and return a list of raw sale dicts."""
+def call_vision_model(image_path: Path) -> list[dict]:
+    """Call the local Ollama /api/generate endpoint and return a list of raw sale dicts."""
     b64 = encode_image(image_path)
-
-    system = SYSTEM_PROMPT
-    if extra_hint:
-        system += (
-            "\n\nIMPORTANT — your previous response contained validation errors. "
-            "Fix only the fields mentioned below and return the full corrected JSON:\n"
-            + extra_hint
-        )
 
     payload = {
         "model": MODEL,
@@ -177,7 +176,6 @@ def call_vision_model(image_path: Path, extra_hint: str = "") -> list[dict]:
         "format": "json",
         "stream": False
     }
-
 
     print("calling ollama")
     response = httpx.post(
@@ -189,7 +187,12 @@ def call_vision_model(image_path: Path, extra_hint: str = "") -> list[dict]:
     print(response.json()['thinking'])
 
     content = response.json()['thinking']
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except:
+        print("Failed to parse JSON response:")
+        print(content)
+        return []
     return parsed.get("sales", [])
 
 
@@ -246,49 +249,16 @@ def process_image(image_path: Path, provider: str, debug: bool = False) -> list[
         raw["leaflet_id"] = leaflet_id
         raw["provider"] = provider
 
-        # --- First attempt ---------------------------------------------------
         try:
             item = SaleItem(**raw)
             approved.append(item)
             if debug:
                 append_approved(item)
             print(f"  [OK]    item {i + 1}: {raw.get('product_name', '?')}")
-            continue
-        except (ValidationError, Exception) as first_err:
-            first_error_str = str(first_err)
-
-        # --- Retry once with error hint --------------------------------------
-        print(
-            f"  [RETRY] item {i + 1}: {raw.get('product_name', '?')} "
-            f"— {first_error_str[:100]}"
-        )
-
-        retry_raw = raw
-        retry_error_str = "retry did not produce output"
-
-        try:
-            retry_items = call_vision_model(image_path, extra_hint=first_error_str)
-            if i < len(retry_items):
-                retry_raw = resolve_dates(retry_items[i])
-                retry_raw["leaflet_id"] = leaflet_id
-                retry_raw["provider"] = provider
-            item = SaleItem(**retry_raw)
-            approved.append(item)
+        except (ValidationError, Exception) as err:
             if debug:
-                append_approved(item)
-            print(f"  [OK]    item {i + 1} after retry")
-            continue
-        except (ValidationError, Exception) as retry_err:
-            retry_error_str = str(retry_err)
-
-        # --- Permanently failed ----------------------------------------------
-        if debug:
-            append_failed(
-                retry_raw,
-                f"first attempt: {first_error_str} | retry: {retry_error_str}",
-                image_path,
-            )
-        print(f"  [FAIL]  item {i + 1}")
+                append_failed(raw, str(err), image_path)
+            print(f"  [FAIL]  item {i + 1}: {raw.get('product_name', '?')} — {str(err)[:100]}")
 
     return approved
 
@@ -321,7 +291,7 @@ def discover_leaflet_dirs(root: Path) -> list[tuple[str, str, Path]]:
             images = discover_images(uuid_dir)
             if not images:
                 continue
-            if is_leaflet_done(provider, uuid):
+            if are_sales_extracted_for_leaflet(provider, uuid):
                 print(f"  [{provider}/{uuid}] already done, skipping.")
                 continue
             result.append((provider, uuid, uuid_dir))
@@ -338,23 +308,31 @@ def process_leaflet_dir(provider: str, uuid: str, uuid_dir: Path, debug: bool) -
     images = discover_images(uuid_dir)
     print(f"  Found {len(images)} image(s)")
 
-    all_items: list[SaleItem] = []
+    total_inserted = 0
     for image_path in images:
-        items = process_image(image_path, provider, debug=debug)
-        all_items.extend(items)
+        page_file = image_path.stem  # e.g. "page_001_0" or "page_001"
+        page_number = page_file.split("_", 1)[1]
 
-    if all_items:
-        records = [item.model_dump(mode="json") for item in all_items]
-        # Convert date objects to datetime for MongoDB
-        for rec in records:
-            for field in ("valid_from", "valid_to"):
-                if isinstance(rec.get(field), str):
-                    from datetime import datetime as dt
-                    rec[field] = dt.fromisoformat(rec[field])
-        inserted = insert_sales(records)
-        print(f"  Inserted {inserted} sale record(s) into MongoDB")
-    else:
-        print("  No valid sale records extracted")
+        if is_page_done(provider, uuid, page_file):
+            print(f"  [{page_file}] already processed, skipping.")
+            continue
+
+        items = process_image(image_path, provider, debug=debug)
+
+        if items:
+            records = [item.model_dump(mode="json") for item in items]
+            for rec in records:
+                for field in ("valid_from", "valid_to"):
+                    if isinstance(rec.get(field), str):
+                        from datetime import datetime as dt
+                        rec[field] = dt.fromisoformat(rec[field])
+            inserted = insert_sales(records)
+            total_inserted += inserted
+            print(f"  Inserted {inserted} sale record(s) for {page_file}")
+
+        mark_page_done(provider, uuid, page_file, page_number)
+
+    print(f"  Total inserted: {total_inserted} sale record(s)")
 
     shutil.rmtree(uuid_dir)
     print(f"  Deleted image directory: {uuid_dir}")

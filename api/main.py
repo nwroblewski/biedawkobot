@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import FastAPI, Query
 from motor.motor_asyncio import AsyncIOMotorClient
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27018")
 MONGO_DB_NAME = os.getenv("MONGO_DB", "biedawkobot")
 
 app = FastAPI(title="Biedawkobot Sales API", version="1.0.0")
@@ -56,9 +56,9 @@ async def get_sales(
         query["category"] = {"$regex": category, "$options": "i"}
 
     if active:
-        today = datetime.combine(date.today(), datetime.min.time())
+        today = datetime.now()
         query["valid_from"] = {"$lte": today}
-        query["valid_to"] = {"$gte": today}
+        query["valid_to"] = {"$gt": today}
 
     cursor = db["sales"].find(query, {"_id": 0})
     return await cursor.to_list(length=None)
