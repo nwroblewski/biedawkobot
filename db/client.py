@@ -126,7 +126,7 @@ def is_page_done(provider: str, uuid: str, page_file: str) -> bool:
     return doc is not None and doc.get("status") == "done"
 
 
-def mark_page_done(provider: str, uuid: str, page_file: str, page_number: int) -> None:
+def mark_page_done(provider: str, uuid: str, page_file: str, page_number: str) -> None:
     """Insert or update a page processing record in the pages collection."""
     db = get_db()
     db["pages"].update_one(
