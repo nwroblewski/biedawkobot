@@ -60,7 +60,7 @@ class SaleItem(BaseModel):
     discount_pct: int | None = None
     unit: str | None = None
     valid_from: date
-    valid_to: date
+    valid_to: date | None
     category: str
     leaflet_id: str
     provider: str
@@ -124,7 +124,7 @@ def resolve_dates(raw: dict) -> dict:
         if vf > vt:
             mm_dd = raw["valid_to"][5:]  # keep the MM-DD part
             raw["valid_to"] = f"{current_year + 1}-{mm_dd}"
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         pass
 
     return raw
